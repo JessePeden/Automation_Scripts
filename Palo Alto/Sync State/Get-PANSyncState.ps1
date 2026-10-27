@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 66
+# Version: 75
 <#
 .SYNOPSIS
     Queries all Panorama-managed firewalls for HA running-sync state and Panorama sync status.
@@ -14,7 +14,7 @@
       6. Write all results sorted by hostname to an XLSX file.
 
     Panorama itself appears as a row in the output with 'Not Applicable' in the
-    Device-Group Status and Template Status columns.
+    Device-Group Status and Template-Stack Status columns.
 
 .PARAMETER PanoramaIP
     IP address or FQDN of the Panorama instance.
@@ -193,7 +193,7 @@ if ($null -ne $dgXml -and $dgXml.response.status -eq "success") {
             $serial = $dev.name
             if ([string]::IsNullOrWhiteSpace($serial)) { continue }
             $status = if ($dev.'shared-policy-status') { $dev.'shared-policy-status' } else { "Unknown" }
-            $dgStatusMap[$serial] = "${dgName}:${status}"
+            $dgStatusMap[$serial] = "${dgName}: ${status}"
         }
     }
 } else {
@@ -222,7 +222,7 @@ if ($null -ne $tmplXml -and $tmplXml.response.status -eq "success") {
             $serial = $dev.name
             if ([string]::IsNullOrWhiteSpace($serial)) { continue }
             $status = if ($dev.'template-status') { $dev.'template-status' } else { "Unknown" }
-            $tmplStatusMap[$serial] = "${tmplName}:${status}"
+            $tmplStatusMap[$serial] = "${tmplName}: ${status}"
         }
     }
 } else {
@@ -253,8 +253,22 @@ $haConnMapping = @{
     'conn-ha2-backup' = 'HA2 Backup Connection Status'
 }
 
+# Compat result field -> version element (present in both local-info and peer-info)
+$haVersionMapping = @{
+    'build-compat'     = 'build-rel'
+    'app-compat'       = 'app-version'
+    'iot-compat'       = 'iot-version'
+    'av-compat'        = 'av-version'
+    'threat-compat'    = 'threat-version'
+    'vpnclient-compat' = 'vpnclient-version'
+    'gpclient-compat'  = 'gpclient-version'
+}
+
+# Fields where local-info holds only Match/Mismatch and peer-info holds the actual version
+$haPeerOnlyVersionFields = @('DLP', 'Cloud-Services', 'cloudconnector', 'OC', 'VMS')
+
 function Get-HaCompatFields {
-    param ($HaNode)
+    param ($HaNode, [hashtable]$VersionInfo = $null)
     $fields = [ordered]@{}
     if ($null -eq $HaNode) { return $fields }
 
@@ -272,6 +286,22 @@ function Get-HaCompatFields {
                     "HA $fieldTitle"
                 }
                 $fields[$header] = [string]$node.InnerText
+
+                if ($null -ne $VersionInfo -and [string]$node.InnerText -eq 'Mismatch') {
+                    if ($haVersionMapping.ContainsKey($fieldName)) {
+                        $versionElement = $haVersionMapping[$fieldName]
+                        $localVerNode   = $HaNode.SelectSingleNode("local-info/$versionElement")
+                        $peerVerNode    = $HaNode.SelectSingleNode("peer-info/$versionElement")
+                        $localVerText   = if ($null -ne $localVerNode) { [string]$localVerNode.InnerText } else { 'N/A' }
+                        $peerVerText    = if ($null -ne $peerVerNode)  { [string]$peerVerNode.InnerText }  else { 'N/A' }
+                        $VersionInfo[$header] = "Local: $localVerText / Peer: $peerVerText"
+                    } elseif ($haPeerOnlyVersionFields -contains $fieldName) {
+                        $peerVerNode = $HaNode.SelectSingleNode("peer-info/$fieldName")
+                        if ($null -ne $peerVerNode) {
+                            $VersionInfo[$header] = "Peer: $([string]$peerVerNode.InnerText) (local version not reported by this command)"
+                        }
+                    }
+                }
             }
         }
     }
@@ -342,7 +372,8 @@ if ($null -ne $panoramaHaXml -and $panoramaHaXml.response.status -eq "success") 
 
 if (-not $panoramaHaState) { $panoramaHaState = "HA not enabled" }
 
-$panoramaHaCompatFields = Get-HaCompatFields -HaNode $panoramaHaXml.response.result
+$panoramaVersionInfo = @{}
+$panoramaHaCompatFields = Get-HaCompatFields -HaNode $panoramaHaXml.response.result -VersionInfo $panoramaVersionInfo
 
 # Query uncommitted changes on primary Panorama
 $panoramaUncommittedAdmins = Get-UncommittedChanges -QueryParams @{
@@ -356,6 +387,7 @@ $panoramaUncommittedAdmins = Get-UncommittedChanges -QueryParams @{
 
 $results             = [System.Collections.Generic.List[PSCustomObject]]::new()
 $uncommittedComments = @{}
+$versionComments     = @{}
 
 # Add the primary Panorama row
 $panoramaUncommittedDisplay = if ($panoramaUncommittedAdmins -eq 'None') { 'None' } else { 'Yes — see comment' }
@@ -365,7 +397,7 @@ $panoramaProps = [ordered]@{
     'Serial Number'       = [string]$panoramaSerial
     'Connection Status'   = [string]'Not Applicable'
     'Device-Group Status' = [string]'Not Applicable'
-    'Template Status'     = [string]'Not Applicable'
+    'Template-Stack Status'     = [string]'Not Applicable'
     'HA Running-Sync'     = [string]$panoramaRunningSync
     'HA State'            = [string]$panoramaHaState
     'Uncommitted Changes' = [string]$panoramaUncommittedDisplay
@@ -373,6 +405,7 @@ $panoramaProps = [ordered]@{
 foreach ($key in $panoramaHaCompatFields.Keys) { $panoramaProps[$key] = $panoramaHaCompatFields[$key] }
 $results.Add([PSCustomObject]$panoramaProps)
 $uncommittedComments[$results.Count - 1] = $panoramaUncommittedAdmins
+$versionComments[$results.Count - 1]     = $panoramaVersionInfo
 
 # Only query the peer if HA is enabled on the primary Panorama
 if ($panoramaHaEnabled -ne "no") {
@@ -458,7 +491,8 @@ if ($panoramaHaEnabled -ne "no") {
 
         if (-not $peerHaState) { $peerHaState = "HA not enabled" }
 
-        $peerHaCompatFields = Get-HaCompatFields -HaNode $peerHaXml.response.result
+        $peerVersionInfo    = @{}
+        $peerHaCompatFields = Get-HaCompatFields -HaNode $peerHaXml.response.result -VersionInfo $peerVersionInfo
 
         # Query uncommitted changes on peer Panorama
         $peerUncommittedAdmins = Get-UncommittedChanges -QueryParams @{
@@ -476,7 +510,7 @@ if ($panoramaHaEnabled -ne "no") {
             'Serial Number'       = [string]$peerSerial
             'Connection Status'   = [string]'Not Applicable'
             'Device-Group Status' = [string]'Not Applicable'
-            'Template Status'     = [string]'Not Applicable'
+            'Template-Stack Status'     = [string]'Not Applicable'
             'HA Running-Sync'     = [string]$peerRunningSync
             'HA State'            = [string]$peerHaState
             'Uncommitted Changes' = [string]$peerUncommittedDisplay
@@ -484,6 +518,7 @@ if ($panoramaHaEnabled -ne "no") {
         foreach ($key in $peerHaCompatFields.Keys) { $peerProps[$key] = $peerHaCompatFields[$key] }
         $results.Add([PSCustomObject]$peerProps)
         $uncommittedComments[$results.Count - 1] = $peerUncommittedAdmins
+        $versionComments[$results.Count - 1]     = $peerVersionInfo
     }
 } else {
     Write-Host "  Panorama HA is not enabled — skipping peer queries.`n" -ForegroundColor Yellow
@@ -529,8 +564,10 @@ foreach ($device in $deviceEntries) {
         }
 
         if (-not $haState -or $haState -eq "Unknown") { $haState = "HA not enabled" }
-        $haCompatFields = Get-HaCompatFields -HaNode $haXml.response.result.group
+        $fwVersionInfo  = @{}
+        $haCompatFields = Get-HaCompatFields -HaNode $haXml.response.result.group -VersionInfo $fwVersionInfo
     } else {
+        $fwVersionInfo  = @{}
         $haCompatFields = [ordered]@{}
     }
 
@@ -553,7 +590,7 @@ foreach ($device in $deviceEntries) {
         'Serial Number'        = [string]$serial
         'Connection Status'    = [string]$connectedStatus
         'Device-Group Status'  = [string]$dgStatus
-        'Template Status'      = [string]$tmplStatus
+        'Template-Stack Status'      = [string]$tmplStatus
         'HA Running-Sync'      = [string]$runningSync
         'HA State'             = [string]$haState
         'Uncommitted Changes'  = [string]$fwUncommittedDisplay
@@ -561,6 +598,7 @@ foreach ($device in $deviceEntries) {
     foreach ($key in $haCompatFields.Keys) { $fwProps[$key] = $haCompatFields[$key] }
     $results.Add([PSCustomObject]$fwProps)
     $uncommittedComments[$results.Count - 1] = $fwUncommittedAdmins
+    $versionComments[$results.Count - 1]     = $fwVersionInfo
 }
 
 # Normalize all result rows to the same property set so Export-Excel and
@@ -571,7 +609,7 @@ $allPropertyNames = $results | ForEach-Object { $_.PSObject.Properties.Name } | 
 # Apply explicit preferred column order
 $preferredOrder = @(
     'Hostname', 'Model', 'Serial Number', 'Connection Status',
-    'Device-Group Status', 'Template Status', 'Uncommitted Changes', 'HA Running-Sync', 'HA State',
+    'Device-Group Status', 'Template-Stack Status', 'Uncommitted Changes', 'HA Running-Sync', 'HA State',
     'HA DLP Version', 'HA PAN-OS Version', 'HA App Version',
     'HA Antivirus Version', 'HA Threat Version', 'HA Legacy VPN Client Version',
     'HA GlobalProtect Version', 'HA Cloud Services', 'HA Cloud Connector',
@@ -658,10 +696,31 @@ try {
                     $rowNum  = $row + 2
                     $colLetter = [char](64 + $uncommittedColIndex)
                     $cell    = $ws.Cells["${colLetter}${rowNum}"]
-                    $comment = $cell.AddComment($admins, "Get-PANSyncState")
+                    $comment = $cell.AddComment("`n" + $admins + "`n", "Get-PANSyncState")
                     $comment.AutoFit = $true
                 }
             }
+        }
+    }
+
+    # Add cell comments with version information for HA compat columns
+    $headerColIndex = @{}
+    for ($col = 1; $col -le $lastCol; $col++) {
+        $headerText = [string]$ws.Cells[1, $col].Value
+        if (-not [string]::IsNullOrWhiteSpace($headerText)) { $headerColIndex[$headerText] = $col }
+    }
+
+    for ($row = 0; $row -lt $sorted.Count; $row++) {
+        $resultIdx = $hostnameToResultIndex[$sorted[$row].Hostname]
+        if ($null -eq $resultIdx -or -not $versionComments.ContainsKey($resultIdx)) { continue }
+        $rowNum = $row + 2
+        foreach ($versionHeader in $versionComments[$resultIdx].Keys) {
+            if (-not $headerColIndex.ContainsKey($versionHeader)) { continue }
+            $colLetter = [char](64 + $headerColIndex[$versionHeader])
+            $cell      = $ws.Cells["${colLetter}${rowNum}"]
+            $comment   = $cell.AddComment("`n" + $versionComments[$resultIdx][$versionHeader] + "`n", "Get-PANSyncState")
+            $comment.AutoFit = $true
+            $cell.Value = ([string]$cell.Value) + ' — see comment'
         }
     }
 
@@ -687,7 +746,7 @@ try {
     $dataRange.Style.Border.Left.Style   = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
     $dataRange.Style.Border.Right.Style  = [OfficeOpenXml.Style.ExcelBorderStyle]::Thin
 
-    # Column index map (1-based): A=Hostname, B=Model, C=Serial Number, D=Connection Status, E=Device-Group Status, F=Template Status, G=Uncommitted Changes, H=HA Running-Sync, I=HA State
+    # Column index map (1-based): A=Hostname, B=Model, C=Serial Number, D=Connection Status, E=Device-Group Status, F=Template-Stack Status, G=Uncommitted Changes, H=HA Running-Sync, I=HA State
     $colConn    = "D"
     $colDG      = "E"
     $colTmpl    = "F"

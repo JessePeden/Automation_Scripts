@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Version: 1
+# Version: 3
 <#
 .SYNOPSIS
     Reads Panorama sync and HA status XLSX files and generates a plain-text
@@ -12,7 +12,7 @@
     Problem conditions:
       Connection Status     : Disconnected
       Device-Group Status   : contains "Out of Sync"
-      Template Status       : contains "Out of Sync"
+      Template-Stack Status       : contains "Out of Sync"
       HA Running-Sync       : contains "not synchronized"
       HA State              : non-functional
       HA compat columns     : Mismatch
@@ -42,7 +42,7 @@ param (
 $problemConditions = [ordered]@{
     'Connection Status'             = { param($v) $v -eq 'Disconnected' }
     'Device-Group Status'           = { param($v) $v -like '*Out of Sync*' }
-    'Template Status'               = { param($v) $v -like '*Out of Sync*' }
+    'Template-Stack Status'               = { param($v) $v -like '*Out of Sync*' }
     'Uncommitted Changes'           = { param($v) $v -eq 'Yes — see comment' }
     'HA Running-Sync'               = { param($v) $v -like '*not synchronized*' }
     'HA State'                      = { param($v) $v -eq 'non-functional' }
@@ -129,6 +129,8 @@ foreach ($file in $xlsxFiles) {
             if (-not $headerMap.ContainsKey($field)) { continue }
             $col   = $headerMap[$field]
             $value = [string]$ws.Cells[$row, $col].Value
+            # Version-comment cells carry a " — see comment" suffix; strip it so conditions and output use the plain value
+            if ($field -ne 'Uncommitted Changes') { $value = $value -replace ' — see comment$', '' }
 
             if (& $problemConditions[$field] $value) {
                 if ($field -eq 'Uncommitted Changes') {
@@ -137,7 +139,7 @@ foreach ($file in $xlsxFiles) {
                     $admins  = if ($null -ne $comment) { $comment.Text.Trim() } else { 'unknown admins' }
                     $rowProblems += "$field`: Yes ($admins)"
                 } else {
-                    # Strip "Name:" prefix from Device-Group and Template Status values
+                    # Strip "Name:" prefix from Device-Group and Template-Stack Status values
                     $displayValue = $value
                     if ($displayValue -match ':') {
                         $displayValue = ($displayValue -split ':')[-1].Trim()
